@@ -1,0 +1,11 @@
+```gitignore
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment variables
+.env
+```

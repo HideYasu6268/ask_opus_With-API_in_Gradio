@@ -52,6 +52,21 @@ def file_id(url: str) -> str:
     return m.group(1)
 
 
+# メッセージ欄からDriveのURLを拾う。ASCII文字だけに限定し、URL直後の日本語や句読点（。、）を巻き込まない
+DRIVE_URL = re.compile(
+    r"https?://(?:drive|docs)\.google\.com/[A-Za-z0-9_\-./?=&%#+~:@]*[A-Za-z0-9_\-/=&%#+~@]")
+
+
+def drive_links(text: str) -> tuple[list[str], str]:
+    """メッセージから(DriveのURL一覧, URLを除いた本文)を返す。"""
+    text = text or ""
+    urls = list(dict.fromkeys(DRIVE_URL.findall(text)))
+    rest = DRIVE_URL.sub("", text)
+    rest = re.sub(r"[ \t]+\n", "\n", rest)
+    rest = re.sub(r"\n{3,}", "\n\n", rest).strip()
+    return urls, rest
+
+
 def fetch_drive_file(url: str) -> dict:
     """共有リンクはファイルIDの入口としてのみ使い、内容はDrive APIで取得する。"""
     svc, fid = _drive(), file_id(url)
@@ -84,7 +99,6 @@ class RelevantFile(BaseModel):
 
 
 class Handoff(BaseModel):
-    user_request: str
     relevant_files: list[RelevantFile]
     retrieval_summary: str
     uncertainties: list[str]
@@ -117,6 +131,22 @@ def make_handoff(files: list[dict], hint: str) -> str:
     return C.HANDOFF_HEADER + json.dumps(data, ensure_ascii=False, indent=1)
 
 
+SUMMARY_PROMPT = """あなたは資料係です。指定ファイルを、後続の相談で使えるよう要約してください。
+- 数値・日付・固有名詞・決定事項は落とさず、正確に残す。
+- ファイルごとに見出しを分け、元の章立てが分かるようにする。
+- 原文にない推測は書かない。読み取れなかった箇所は末尾に「不明点」として書く。
+- 相談文の下書きがあれば関連の深い部分を厚めにする。ただし無関係に見える部分も1〜2行は残す。"""
+
+SUMMARY_HEADER = ("以下は資料をGeminiが要約したもの。原文ではなく、細部は省略されている可能性がある。"
+                  "正確な数値や文言が必要な場合は、要約では確認できないことをユーザーに伝えること。\n\n")
+
+
+def make_summary(files: list[dict], hint: str) -> str:
+    parts = [p for f in files for p in _file_parts(f)]
+    parts.append(f"=== ユーザーの相談（下書き。空のこともある） ===\n{hint or '（未入力）'}")
+    return SUMMARY_HEADER + _gen(parts, system_instruction=SUMMARY_PROMPT).text
+
+
 def make_fulltext(files: list[dict]) -> str:
     out = []
     for f in files:
@@ -142,19 +172,28 @@ def cc(ttl: str | None) -> dict:
     return {"type": "ephemeral", "ttl": "1h"} if ttl == "1h" else {"type": "ephemeral"}
 
 
-def build_system(handoff: str | None, ttl: str) -> list[dict]:
-    """system → 資料 の順。資料はsystem側に置き、ここにキャッシュ境界を置く。"""
+def build_system(docs: list[str] | None, ttl: str) -> list[dict]:
+    """system → 資料1 → 資料2 … の順。資料は追加方式で、古い資料の並びと中身は変えない。
+    キャッシュ境界は新しい側の2つの資料に置く（上限4個のうち、履歴用に1個を残す）。"""
     blocks = [{"type": "text", "text": C.BASE_SYSTEM}]
-    if handoff:
-        blocks.append({"type": "text", "text": handoff, "cache_control": cc(ttl)})
+    docs = docs or []
+    for i, d in enumerate(docs):
+        b = {"type": "text", "text": f"【資料セット{i + 1}】\n{d}"}
+        if i >= len(docs) - 2:
+            b["cache_control"] = cc(ttl)
+        blocks.append(b)
     return blocks
 
 
-def build_messages(history, question: str, ttl: str | None) -> list[dict]:
+def build_messages(history, question: str, ttl: str | None, cache_last: bool = False) -> list[dict]:
+    """cache_last=True: 今回のユーザー発言（添付資料入り）にもキャッシュ境界を置き、書き込みを1回で済ませる。
+    境界の合計は 資料2 + 履歴末尾1 + 今回1 = 4（上限）。"""
     msgs = [{"role": r, "content": c} for r, c in history]
     if msgs and ttl:  # 資料ありの場合のみ、履歴末尾にもキャッシュ境界を置く
         msgs[-1]["content"] = [{"type": "text", "text": msgs[-1]["content"], "cache_control": cc(ttl)}]
     msgs.append({"role": "user", "content": question})
+    if cache_last and ttl:
+        msgs[-1]["content"] = [{"type": "text", "text": question, "cache_control": cc(ttl)}]
     return msgs
 
 
@@ -170,11 +209,11 @@ def request_kwargs(model: str, system, messages, length: str, think: str) -> dic
     return kw
 
 
-def warm_cache(model: str, handoff: str, ttl: str):
-    """出力を最小にしたリクエストでhandoffをキャッシュへ書き込む。"""
+def warm_cache(model: str, docs: list[str], history, ttl: str):
+    """出力を最小にしたリクエストで、資料と履歴をキャッシュへ書き込む（資料を追加した直後に使う）。"""
     r = claude().messages.create(
-        model=C.MODELS[model]["id"], max_tokens=1, system=build_system(handoff, ttl),
-        messages=[{"role": "user", "content": "資料の読み込み確認"}], thinking={"type": "disabled"},
+        model=C.MODELS[model]["id"], max_tokens=1, system=build_system(docs, ttl),
+        messages=build_messages(history, "資料の読み込み確認", ttl), thinking={"type": "disabled"},
     )
     return r.usage
 
