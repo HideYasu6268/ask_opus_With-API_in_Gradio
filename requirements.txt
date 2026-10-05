@@ -1,0 +1,6 @@
+gradio>=5.20,<6
+anthropic
+google-genai
+google-api-python-client
+google-auth
+pydantic>=2
