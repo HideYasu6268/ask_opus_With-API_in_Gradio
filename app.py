@@ -236,7 +236,14 @@ footer{display:none !important}
 #chat{border:none !important;box-shadow:none !important;background:transparent !important}
 #chat [data-testid="bot"]{background:transparent !important;border:none !important;
   font-family:"Hiragino Mincho ProN","Noto Serif JP",serif;line-height:1.75}
-#chat [data-testid="user"]{background:#f0eee6 !important;border:none !important;border-radius:18px}
+/* ユーザー発言: ライトは淡いベージュ、ダークは濃いグレー。文字色も明示して読めなくなるのを防ぐ */
+#chat .bubble-wrap{background:transparent !important}
+#chat .message-bubble-border,#chat .flex-wrap.user{background:transparent !important;border:none !important;box-shadow:none !important}
+#chat [data-testid="user"]{background:#f0eee6 !important;border:none !important;border-radius:18px;color:#141413 !important}
+#chat [data-testid="user"] :is(p,span,div,li){color:inherit !important}
+.dark #chat [data-testid="user"]{background:#30302e !important;color:#faf9f5 !important}
+.dark #composer{background:#30302e !important;border-color:#3d3d3a !important}
+.dark #composer textarea{color:#faf9f5 !important}
 #composer{border:1px solid #e3e0d6;border-radius:22px;padding:8px 12px;
   box-shadow:0 2px 10px rgba(0,0,0,.05);background:#fff}
 #composer textarea{border:none !important;box-shadow:none !important;background:transparent !important}
@@ -283,7 +290,6 @@ with gr.Blocks(title="ask_opus_With_API_in_Gradio", theme=THEME, css=CSS) as dem
     model.change(lambda m: gr.update(choices=length_choices(m)), model, length)
     prep_in = [urls, read_mode, model, length, think, question, state]
     prep_btn.click(prepare, prep_in, [prep_status, state]).then(cache_status, refresh_in, cache_md)
-    urls.submit(prepare, prep_in, [prep_status, state]).then(cache_status, refresh_in, cache_md)  # リンクを入れてEnterで即開始
     est_btn.click(estimate_now, [question, model, length, think, state], cost)
     c_in, c_out = [question, read_mode, model, length, think, state, chat], [chat, state, cost, question]
     send.click(consult, c_in, c_out).then(cache_status, refresh_in, cache_md)
@@ -293,4 +299,4 @@ if __name__ == "__main__":
     demo.queue().launch(
         server_name="0.0.0.0", server_port=int(os.getenv("PORT", "8080")),
         auth=(os.getenv("APP_USER", "me"), pw) if pw else None,
-    )	
+    )
