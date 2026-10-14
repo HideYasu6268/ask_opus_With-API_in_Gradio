@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import time
 import re
 from functools import cache
 from typing import Literal
@@ -116,68 +117,16 @@ HANDOFF_PROMPT = """あなたは資料係です。指定ファイルから、ユ
 - 相談が未入力・曖昧なら、資料全体の重要事項（年表・決定事項・数値・固有名詞）を広めに抜粋する。"""
 
 
-DEFAULT_FALLBACK_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-8b",
-]
-
-_cached_models: list[str] = []
-
-
-def _model_sort_key(name: str):
-    n = name.lower()
-    is_lite = 1 if ("lite" in n or "8b" in n) else 0
-    is_exp = 1 if ("exp" in n or "preview" in n) else 0
-    m = re.search(r"gemini-(\d+(?:\.\d+)*)", n)
-    if m:
-        ver = tuple(int(x) for x in m.group(1).split("."))
-    elif "latest" in n:
-        ver = (999,)
-    else:
-        ver = (0,)
-    # 通常flash(安定版) -> 通常flash(exp/preview) -> lite(安定版) -> lite(exp/preview)
-    # それぞれバージョン降順
-    return (is_lite, is_exp, tuple(-x for x in ver), n)
+# 使うモデルを固定: 2.5-flash → ダメなら 2.5-flash-lite
+PREFERRED_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 
 def get_candidate_models() -> list[str]:
-    """APIからモデル一覧を取得し、flashの新しい順 -> liteモデルの順にソートして返す。"""
-    global _cached_models
-    if _cached_models:
-        return _cached_models
-
-    candidates = []
-    try:
-        for m in gemini().models.list():
-            name = m.name or ""
-            clean = name.removeprefix("models/")
-            n = clean.lower()
-            actions = getattr(m, "supported_actions", None)
-            if actions and "generateContent" not in actions:
-                continue
-            if "gemini" in n and "flash" in n:
-                candidates.append(clean)
-    except Exception as e:
-        logger.warning("Geminiモデル一覧の取得に失敗しました。デフォルト候補を使用します: %s", e)
-
-    if candidates:
-        candidates = sorted(list(dict.fromkeys(candidates)), key=_model_sort_key)
-    else:
-        candidates = list(DEFAULT_FALLBACK_MODELS)
-
+    """候補モデルを返す。環境変数 GEMINI_MODEL があれば先頭に追加する。"""
     if C.GEMINI_MODEL:
         pref = C.GEMINI_MODEL.removeprefix("models/")
-        if pref in candidates:
-            candidates.remove(pref)
-        candidates.insert(0, pref)
-
-    _cached_models = candidates
-    logger.info("Gemini候補モデル一覧: %s", _cached_models)
-    return _cached_models
+        return [pref] + [m for m in PREFERRED_MODELS if m != pref]
+    return list(PREFERRED_MODELS)
 
 
 def _gen_stream(contents, **cfg):
@@ -202,9 +151,17 @@ def _gen_stream(contents, **cfg):
         yield status, None, None
 
         try:
-            res = gemini().models.generate_content(
-                model=model, contents=contents, config=types.GenerateContentConfig(**cfg)
-            )
+            res = None
+            for attempt in range(3):  # 503(混雑)などは2秒・4秒待って同じモデルを再試行
+                try:
+                    res = gemini().models.generate_content(
+                        model=model, contents=contents, config=types.GenerateContentConfig(**cfg)
+                    )
+                    break
+                except errors.ServerError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2 * (attempt + 1))
             yield f"使用モデル: {model}", res, model
             return
         except errors.ClientError as e:
@@ -349,7 +306,7 @@ def cc(ttl: str | None) -> dict:
 def build_system(docs: list[str] | None, ttl: str) -> list[dict]:
     """system → 資料1 → 資料2 … の順。資料は追加方式で、古い資料の並びと中身は変えない。
     キャッシュ境界は新しい側の2つの資料に置く（上限4個のうち、履歴用に1個を残す）。"""
-    blocks = [{"type": "text", "text": C.BASE_SYSTEM}]
+    blocks = [{"type": "text", "text": C.BASE_SYSTEM}] if C.BASE_SYSTEM else []  # 空のテキストブロックはAPIが拒否する
     docs = docs or []
     for i, d in enumerate(docs):
         b = {"type": "text", "text": f"【資料セット{i + 1}】\n{d}"}
@@ -374,12 +331,14 @@ def build_messages(history, question: str, ttl: str | None, cache_last: bool = F
 def request_kwargs(model: str, system, messages, length: str, think: str) -> dict:
     effort = C.THINK[think]
     max_tokens = C.LENGTH[length] + (C.THINK_HEADROOM[effort] if effort else 0)  # 思考はmax_tokensに含まれる
-    kw = dict(model=C.MODELS[model]["id"], system=system, messages=messages, max_tokens=max_tokens)
+    kw = dict(model=C.MODELS[model]["id"], messages=messages, max_tokens=max_tokens)
+    if system:  # 資料なし＋BASE_SYSTEM空のときはsystemを送らない
+        kw["system"] = system
     if effort:
         kw["thinking"] = {"type": "adaptive"}
         kw["extra_body"] = {"output_config": {"effort": effort}}
     else:
-        kw["thinking"] = {"type": "disabled"}
+        kw["thinking"] = C.THINKING_OFF
     return kw
 
 
@@ -387,19 +346,22 @@ def warm_cache(model: str, docs: list[str], history, ttl: str):
     """出力を最小にしたリクエストで、資料と履歴をキャッシュへ書き込む（資料を追加した直後に使う）。"""
     r = claude().messages.create(
         model=C.MODELS[model]["id"], max_tokens=1, system=build_system(docs, ttl),
-        messages=build_messages(history, "資料の読み込み確認", ttl), thinking={"type": "disabled"},
+        messages=build_messages(history, "資料の読み込み確認", ttl), thinking=C.THINKING_OFF,
     )
     return r.usage
 
 
 def _count(model_id, system, messages) -> int:
-    return claude().messages.count_tokens(model=model_id, system=system, messages=messages).input_tokens
+    kw = dict(model=model_id, messages=messages)
+    if system:
+        kw["system"] = system
+    return claude().messages.count_tokens(**kw).input_tokens
 
 
 def estimate(model: str, system, messages, max_tokens: int, ttl: str) -> dict:
     m = C.MODELS[model]
     total = _count(m["id"], system, messages)
-    prefix = _count(m["id"], system, [{"role": "user", "content": "."}]) if len(system) > 1 else 0
+    prefix = _count(m["id"], system, [{"role": "user", "content": "."}]) if system else 0
     rest = max(total - prefix, 0)
     write = m["w1h"] if ttl == "1h" else m["w5m"]
     return dict(
