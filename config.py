@@ -7,7 +7,8 @@ MODELS = {
     "Opus": dict(id="claude-opus-5-5", inp=4.0, out=20.0, w5m=5.0, w1h=8.0, read=0.20),
 }
 USD_JPY = float(os.getenv("USD_JPY", "150"))
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# Geminiモデル指定。未設定時はAPIから一覧を取得してflash（新しい順）→liteの順にフォールバック試行
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")
 CACHE_TTL = os.getenv("CACHE_TTL", "1h")  # "1h"（既定）または "5m"
 
 # 回答の長さ: 出力上限（思考分は別枠で自動加算）

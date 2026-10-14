@@ -1,0 +1,42 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "groq1": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Groq Account 1",
+      "options": {
+        "baseURL": "https://api.groq.com/openai/v1"
+      },
+      "models": {
+        "openai/gpt-oss-120b": {
+          "name": "GPT OSS 120B",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning" }
+        }
+      }
+    },
+
+    "groq2": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Groq Account 2",
+      "options": {
+        "baseURL": "https://api.groq.com/openai/v1"
+      },
+      "models": {
+        "openai/gpt-oss-120b": {
+          "name": "GPT OSS 120B"
+        }
+      }
+    },
+
+    "gemini1": {
+      "npm": "@ai-sdk/google",
+      "name": "Gemini Account 1",
+      "models": {
+        "gemini-3.6-flash": {
+          "name": "Gemini 2.5 Flash"
+        }
+      }
+    }
+  }
+}

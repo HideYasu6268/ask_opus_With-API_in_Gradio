@@ -1,6 +1,6 @@
-```gitignore
 # Python virtual environment
 venv/
+.venv/
 
 # Python cache
 __pycache__/
@@ -8,4 +8,3 @@ __pycache__/
 
 # Environment variables
 .env
-```

@@ -1,5 +1,6 @@
 """Claude / Gemini / Google Drive まわりの処理。"""
 import json
+import logging
 import os
 import re
 from functools import cache
@@ -8,10 +9,13 @@ from typing import Literal
 import anthropic
 import google.auth
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import gradio as gr
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 import config as C
 
@@ -112,10 +116,134 @@ HANDOFF_PROMPT = """あなたは資料係です。指定ファイルから、ユ
 - 相談が未入力・曖昧なら、資料全体の重要事項（年表・決定事項・数値・固有名詞）を広めに抜粋する。"""
 
 
+DEFAULT_FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-8b",
+]
+
+_cached_models: list[str] = []
+
+
+def _model_sort_key(name: str):
+    n = name.lower()
+    is_lite = 1 if ("lite" in n or "8b" in n) else 0
+    is_exp = 1 if ("exp" in n or "preview" in n) else 0
+    m = re.search(r"gemini-(\d+(?:\.\d+)*)", n)
+    if m:
+        ver = tuple(int(x) for x in m.group(1).split("."))
+    elif "latest" in n:
+        ver = (999,)
+    else:
+        ver = (0,)
+    # 通常flash(安定版) -> 通常flash(exp/preview) -> lite(安定版) -> lite(exp/preview)
+    # それぞれバージョン降順
+    return (is_lite, is_exp, tuple(-x for x in ver), n)
+
+
+def get_candidate_models() -> list[str]:
+    """APIからモデル一覧を取得し、flashの新しい順 -> liteモデルの順にソートして返す。"""
+    global _cached_models
+    if _cached_models:
+        return _cached_models
+
+    candidates = []
+    try:
+        for m in gemini().models.list():
+            name = m.name or ""
+            clean = name.removeprefix("models/")
+            n = clean.lower()
+            actions = getattr(m, "supported_actions", None)
+            if actions and "generateContent" not in actions:
+                continue
+            if "gemini" in n and "flash" in n:
+                candidates.append(clean)
+    except Exception as e:
+        logger.warning("Geminiモデル一覧の取得に失敗しました。デフォルト候補を使用します: %s", e)
+
+    if candidates:
+        candidates = sorted(list(dict.fromkeys(candidates)), key=_model_sort_key)
+    else:
+        candidates = list(DEFAULT_FALLBACK_MODELS)
+
+    if C.GEMINI_MODEL:
+        pref = C.GEMINI_MODEL.removeprefix("models/")
+        if pref in candidates:
+            candidates.remove(pref)
+        candidates.insert(0, pref)
+
+    _cached_models = candidates
+    logger.info("Gemini候補モデル一覧: %s", _cached_models)
+    return _cached_models
+
+
+def _gen_stream(contents, **cfg):
+    """(status_msg, response, model_name) を yield するジェネレータ。
+    試行中・フォールバック時は (msg, None, None) を yield し、
+    成功時は (f"使用モデル: {model}", response, model) を yield する。
+    """
+    models = get_candidate_models()
+    last_err = None
+    for i, model in enumerate(models):
+        if i == 0:
+            status = f"{model} を試行中…"
+        else:
+            status = f"前モデルでエラーのため {model} に切り替えて試行中…"
+
+        logger.info("Gemini: %s", status)
+        try:
+            gr.Info(f"Gemini: {status}")
+        except Exception:
+            pass
+
+        yield status, None, None
+
+        try:
+            res = gemini().models.generate_content(
+                model=model, contents=contents, config=types.GenerateContentConfig(**cfg)
+            )
+            yield f"使用モデル: {model}", res, model
+            return
+        except errors.ClientError as e:
+            if getattr(e, "code", None) in (401, 403):
+                raise
+            last_err = e
+            err_msg = f"{model} でエラー (code={getattr(e, 'code', None)}): {e}"
+            logger.warning(err_msg)
+            try:
+                gr.Warning(f"Gemini: {model} でエラー (code={getattr(e, 'code', None)})")
+            except Exception:
+                pass
+        except (errors.ServerError, errors.APIError) as e:
+            last_err = e
+            err_msg = f"{model} でサーバーエラー ({type(e).__name__})"
+            logger.warning("%s: %s", err_msg, e)
+            try:
+                gr.Warning(f"Gemini: {model} でサーバーエラー (503等)。次の候補へ切り替えます")
+            except Exception:
+                pass
+        except Exception as e:
+            last_err = e
+            logger.warning("Gemini: %s で予期せぬエラー: %s", model, e)
+            try:
+                gr.Warning(f"Gemini: {model} でエラー発生。次の候補へ切り替えます")
+            except Exception:
+                pass
+
+    raise RuntimeError(
+        f"すべてのGemini候補モデルの試行に失敗しました（最後のエラー: {last_err}）"
+    ) from last_err
+
+
 def _gen(contents, **cfg):
-    return gemini().models.generate_content(
-        model=C.GEMINI_MODEL, contents=contents, config=types.GenerateContentConfig(**cfg)
-    )
+    last_res = None
+    for _, res, _ in _gen_stream(contents, **cfg):
+        if res is not None:
+            last_res = res
+    return last_res
 
 
 def _file_parts(f):
@@ -123,12 +251,24 @@ def _file_parts(f):
     return [f"=== ファイル: {f['name']} ===", body]
 
 
-def make_handoff(files: list[dict], hint: str) -> str:
+def make_handoff_stream(files: list[dict], hint: str):
     parts = [p for f in files for p in _file_parts(f)]
     parts.append(f"=== ユーザーの相談（下書き。空のこともある） ===\n{hint or '（未入力）'}")
-    r = _gen(parts, system_instruction=HANDOFF_PROMPT, response_mime_type="application/json", response_schema=Handoff)
-    data = r.parsed.model_dump() if r.parsed else json.loads(r.text)
-    return C.HANDOFF_HEADER + json.dumps(data, ensure_ascii=False, indent=1)
+    for status, res, model in _gen_stream(
+        parts, system_instruction=HANDOFF_PROMPT, response_mime_type="application/json", response_schema=Handoff
+    ):
+        if res is None:
+            yield status, None, None
+        else:
+            data = res.parsed.model_dump() if res.parsed else json.loads(res.text)
+            doc = C.HANDOFF_HEADER + json.dumps(data, ensure_ascii=False, indent=1)
+            yield status, doc, model
+
+
+def make_handoff(files: list[dict], hint: str) -> str:
+    for _, doc, _ in make_handoff_stream(files, hint):
+        if doc is not None:
+            return doc
 
 
 SUMMARY_PROMPT = """あなたは資料係です。指定ファイルを、後続の相談で使えるよう要約してください。
@@ -141,30 +281,64 @@ SUMMARY_HEADER = ("以下は資料をGeminiが要約したもの。原文では�
                   "正確な数値や文言が必要な場合は、要約では確認できないことをユーザーに伝えること。\n\n")
 
 
-def make_summary(files: list[dict], hint: str) -> str:
+def make_summary_stream(files: list[dict], hint: str):
     parts = [p for f in files for p in _file_parts(f)]
     parts.append(f"=== ユーザーの相談（下書き。空のこともある） ===\n{hint or '（未入力）'}")
-    return SUMMARY_HEADER + _gen(parts, system_instruction=SUMMARY_PROMPT).text
+    for status, res, model in _gen_stream(parts, system_instruction=SUMMARY_PROMPT):
+        if res is None:
+            yield status, None, None
+        else:
+            doc = SUMMARY_HEADER + res.text
+            yield status, doc, model
 
 
-def make_fulltext(files: list[dict]) -> str:
+def make_summary(files: list[dict], hint: str) -> str:
+    for _, doc, _ in make_summary_stream(files, hint):
+        if doc is not None:
+            return doc
+
+
+def make_fulltext_stream(files: list[dict]):
     out = []
+    last_model = None
     for f in files:
         text = f["text"]
         if text is None:  # PDFは忠実にテキスト化（出力が長大な場合は途中で切れ得る）
-            text = _gen(
+            for status, res, model in _gen_stream(
                 [types.Part.from_bytes(data=f["pdf"], mime_type="application/pdf"),
                  "このPDFの全文を、要約・改変せず忠実にテキスト化してください。図表は[図: 内容]の形で簡潔に。"]
-            ).text
+            ):
+                if res is None:
+                    yield f"{f['name']}: {status}", None, None
+                else:
+                    text = res.text
+                    last_model = model
         out.append(f'<file name="{f["name"]}">\n{text}\n</file>')
-    return C.FULLTEXT_HEADER + "\n".join(out)
+    doc = C.FULLTEXT_HEADER + "\n".join(out)
+    yield "完了", doc, (last_model or "PDFテキスト抽出なし")
+
+
+def make_fulltext(files: list[dict]) -> str:
+    for _, doc, _ in make_fulltext_stream(files):
+        if doc is not None:
+            return doc
+
+
+def summarize_history_stream(turns: list[tuple[str, str]]):
+    log = "\n".join(f"{'ユーザー' if r == 'user' else 'アシスタント'}: {c}" for r, c in turns)
+    for status, res, model in _gen_stream(
+        f"次の会話ログを、後続の相談に必要な事実・決定・論点・ユーザーの意向を落とさず簡潔に要約してください。\n\n{log}"
+    ):
+        if res is None:
+            yield status, None, None
+        else:
+            yield status, res.text, model
 
 
 def summarize_history(turns: list[tuple[str, str]]) -> str:
-    log = "\n".join(f"{'ユーザー' if r == 'user' else 'アシスタント'}: {c}" for r, c in turns)
-    return _gen(
-        f"次の会話ログを、後続の相談に必要な事実・決定・論点・ユーザーの意向を落とさず簡潔に要約してください。\n\n{log}"
-    ).text
+    for _, text, _ in summarize_history_stream(turns):
+        if text is not None:
+            return text
 
 
 # ---------------- Claude（相談・推論） ----------------

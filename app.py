@@ -9,6 +9,11 @@ import services as S
 
 SEARCH, SUMMARY, FULL = "関連箇所を抜粋", "要約", "ファイル全体を読む"
 BUSY = {SEARCH: "Geminiが関連箇所を抽出中…", SUMMARY: "Geminiが要約中…", FULL: "全文をテキスト化中…"}
+MAKE_STREAM = {
+    SEARCH: S.make_handoff_stream,
+    SUMMARY: S.make_summary_stream,
+    FULL: S.make_fulltext_stream,
+}
 MAKE = {SEARCH: lambda f, h: S.make_handoff(f, h),
         SUMMARY: lambda f, h: S.make_summary(f, h),
         FULL: lambda f, h: S.make_fulltext(f)}
@@ -103,8 +108,15 @@ def prepare(urls, read_mode, model, length, think, question, state):
     try:
         yield "📥 Driveから取得中…", state
         files = [S.fetch_drive_file(u) for u in links]
-        yield f"🔎 {BUSY[read_mode]}", state
-        doc = MAKE[read_mode](files, hint)
+        doc = None
+        stream_fn = MAKE_STREAM[read_mode]
+        args = (files, hint) if read_mode != FULL else (files,)
+        for status_msg, result, used_model in stream_fn(*args):
+            if result is None:
+                yield f"🔎 Gemini: {status_msg}", state
+            else:
+                doc = result
+                gemini_label = f"（Gemini: {used_model}）"
         docs = state["docs"] + [doc]  # 成功するまでstateは変えない（失敗しても今までの資料は残る）
         yield "💾 Claudeのキャッシュへ書き込み中…", state
         u = S.warm_cache(model, docs, state["history"], TTL)
@@ -117,7 +129,7 @@ def prepare(urls, read_mode, model, length, think, question, state):
         if not written:
             note = "⚠️ キャッシュに書き込まれていません（資料が最小キャッシュ長に満たない可能性）"
         est = estimate_now(hint, model, length, think, state)
-        yield f"✅ 資料を追加しました（{', '.join(f['name'] for f in files)}）。{note}\n\n{est}", state
+        yield f"✅ 資料を追加しました {gemini_label}（{', '.join(f['name'] for f in files)}）。{note}\n\n{est}", state
     except Exception as e:  # noqa: BLE001
         yield f"❌ 資料の追加に失敗: {e}", state
 
@@ -136,8 +148,13 @@ def consult(question, read_mode, model, length, think, state, chat):
         try:
             yield chat, state, "📥 Driveから取得中…", raw
             files = [S.fetch_drive_file(u) for u in attach_links]
-            yield chat, state, f"🔎 {BUSY[read_mode]}", raw
-            attach = MAKE[read_mode](files, question)  # 抽出・要約の基準は、今送る質問そのもの
+            stream_fn = MAKE_STREAM[read_mode]
+            args = (files, question) if read_mode != FULL else (files,)
+            for status_msg, result, used_model in stream_fn(*args):
+                if result is None:
+                    yield chat, state, f"🔎 Gemini: {status_msg}", raw
+                else:
+                    attach = result
             names = [f["name"] for f in files]
         except Exception as e:  # noqa: BLE001
             yield chat, state, f"❌ 資料の取得に失敗: {e}", raw
@@ -157,7 +174,12 @@ def consult(question, read_mode, model, length, think, state, chat):
         notes.append(f"資料キャッシュが期限切れ（最後の使用から約{idle / 60:.0f}分）のため、今回は書き込み直しになります")
     if sum(len(c) for _, c in hist) > C.COMPRESS_CHARS and len(hist) > C.KEEP_TURNS * 2:
         old, recent = hist[: -C.KEEP_TURNS * 2], hist[-C.KEEP_TURNS * 2:]
-        summary = S.summarize_history(old)  # 古いターンのみ要約。直近は原文のまま
+        summary = None
+        for status_msg, result, _ in S.summarize_history_stream(old):  # 古いターンのみ要約。直近は原文のまま
+            if result is None:
+                yield chat, state, f"🔁 履歴を圧縮中… Gemini: {status_msg}", raw
+            else:
+                summary = result
         hist = [("user", f"【これまでの会話の要約】\n{summary}"), ("assistant", "了解しました。")] + recent
         state["history"] = hist
         notes.append("履歴を要約したため、今回はキャッシュが1回切れます")
