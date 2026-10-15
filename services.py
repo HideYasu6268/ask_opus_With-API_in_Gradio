@@ -4,6 +4,8 @@ import logging
 import os
 import time
 import re
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from functools import cache
 from typing import Literal
 
@@ -26,9 +28,24 @@ def claude():
     return anthropic.Anthropic()  # ANTHROPIC_API_KEY（環境変数 / Secret Manager）
 
 
+def gemini_keys() -> list[str]:
+    """GEMINI_API_KEY（先頭）と GEMINI_API_KEYS（カンマ/空白/改行区切り）を、重複なしで順に集める。
+    別アカウントのキーを並べておくと、アカウント/プロジェクト単位の失敗（429・404など）のときに次のキーで再試行する。
+    どのキーも【有料枠】にすること（無料枠は、送った内容がGoogleの製品改善に使われ得る）。"""
+    raw = [os.getenv("GEMINI_API_KEY", "")] + re.split(r"[,\s]+", os.getenv("GEMINI_API_KEYS", ""))
+    return list(dict.fromkeys(k.strip() for k in raw if k.strip()))
+
+
 @cache
+def _clients() -> list:
+    keys = gemini_keys()
+    if len(keys) > 1:
+        logger.info("Gemini: %d 個のAPIキーを使います", len(keys))
+    return [genai.Client(api_key=k) for k in keys] or [genai.Client()]  # キーが環境変数に無ければSDKの既定（GOOGLE_API_KEY等）
+
+
 def gemini():
-    return genai.Client()  # GEMINI_API_KEY。有料枠のキーを使うこと
+    return _clients()[0]  # 題名生成など、キーの切り替えが要らない用途は先頭のキー
 
 
 # ---------------- Drive ----------------
@@ -84,7 +101,8 @@ def fetch_drive_file(url: str) -> dict:
     f = {"name": meta["name"], "mime": mime, "text": None, "pdf": None}
     if mime == "application/pdf":
         f["pdf"] = data
-    elif mime in EXPORT or mime.startswith("text/") or mime == "application/json":
+    elif (mime in EXPORT or mime.startswith("text/") or mime == "application/json"
+          or meta["name"].lower().endswith((".txt", ".md", ".markdown"))):  # .mdはDrive上で汎用バイナリ扱いのことがある
         f["text"] = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
     else:
         raise ValueError(f"未対応の形式です: {meta['name']} ({mime})")
@@ -117,8 +135,8 @@ HANDOFF_PROMPT = """あなたは資料係です。指定ファイルから、ユ
 - 相談が未入力・曖昧なら、資料全体の重要事項（年表・決定事項・数値・固有名詞）を広めに抜粋する。"""
 
 
-# 使うモデルを固定: 2.5-flash → ダメなら 2.5-flash-lite
-PREFERRED_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+# 使うモデルを固定: 3.5-flash → ダメなら 3.5-flash-lite（2.5系は新規ユーザーには提供終了: 404 NOT_FOUND）
+PREFERRED_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
 
 
 def get_candidate_models() -> list[str]:
@@ -129,66 +147,87 @@ def get_candidate_models() -> list[str]:
     return list(PREFERRED_MODELS)
 
 
-def _gen_stream(contents, **cfg):
+def _warn(msg: str):
+    try:
+        gr.Warning(msg)
+    except Exception:  # noqa: BLE001  画面の文脈が無いスレッドでは出さない
+        pass
+
+
+def _info(msg: str):
+    try:
+        gr.Info(msg)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _gen_stream(contents, *, models=None, **cfg):
     """(status_msg, response, model_name) を yield するジェネレータ。
-    試行中・フォールバック時は (msg, None, None) を yield し、
-    成功時は (f"使用モデル: {model}", response, model) を yield する。
-    """
-    models = get_candidate_models()
+    試行中・フォールバック時は (msg, None, None) を yield し、成功時は (f"使用モデル: {model}", response, model) を yield する。
+    モデルごとに、キーを順に試す。401/403（キーの不備）・404・429（アカウント/プロジェクト単位の失敗）のときだけ次のキーへ。
+    503（Google側の混雑）などはキーを替えても同じなので、次のモデルへ進む。全キーが401/403ならそのまま投げる（設定の問題）。"""
+    models = list(models) if models is not None else get_candidate_models()
+    clients = _clients()
+    many = len(clients) > 1
     last_err = None
     for i, model in enumerate(models):
-        if i == 0:
-            status = f"{model} を試行中…"
-        else:
-            status = f"前モデルでエラーのため {model} に切り替えて試行中…"
-
+        status = f"{model} を試行中…" if i == 0 else f"前モデルでエラーのため {model} に切り替えて試行中…"
         logger.info("Gemini: %s", status)
-        try:
-            gr.Info(f"Gemini: {status}")
-        except Exception:
-            pass
-
+        _info(f"Gemini: {status}")
         yield status, None, None
 
-        try:
-            res = None
-            for attempt in range(3):  # 503(混雑)などは2秒・4秒待って同じモデルを再試行
-                try:
-                    res = gemini().models.generate_content(
-                        model=model, contents=contents, config=types.GenerateContentConfig(**cfg)
-                    )
-                    break
-                except errors.ServerError:
-                    if attempt == 2:
-                        raise
-                    time.sleep(2 * (attempt + 1))
-            yield f"使用モデル: {model}", res, model
-            return
-        except errors.ClientError as e:
-            if getattr(e, "code", None) in (401, 403):
-                raise
-            last_err = e
-            err_msg = f"{model} でエラー (code={getattr(e, 'code', None)}): {e}"
-            logger.warning(err_msg)
+        auth_only = True  # このモデルでの失敗が、すべて401/403か
+        for ki, cl in enumerate(clients):
+            tag = f"（キー{ki + 1}/{len(clients)}）" if many else ""
+            if ki:
+                msg = f"{model} をキー{ki + 1}で再試行中…"
+                logger.info("Gemini: %s", msg)
+                _info(f"Gemini: {msg}")
+                yield msg, None, None
             try:
-                gr.Warning(f"Gemini: {model} でエラー (code={getattr(e, 'code', None)})")
-            except Exception:
-                pass
-        except (errors.ServerError, errors.APIError) as e:
-            last_err = e
-            err_msg = f"{model} でサーバーエラー ({type(e).__name__})"
-            logger.warning("%s: %s", err_msg, e)
-            try:
-                gr.Warning(f"Gemini: {model} でサーバーエラー (503等)。次の候補へ切り替えます")
-            except Exception:
-                pass
-        except Exception as e:
-            last_err = e
-            logger.warning("Gemini: %s で予期せぬエラー: %s", model, e)
-            try:
-                gr.Warning(f"Gemini: {model} でエラー発生。次の候補へ切り替えます")
-            except Exception:
-                pass
+                res = None
+                for attempt in range(3):  # 503(混雑)などは2秒・4秒待って同じモデル・同じキーを再試行
+                    try:
+                        res = cl.models.generate_content(
+                            model=model, contents=contents, config=types.GenerateContentConfig(**cfg))
+                        break
+                    except errors.ServerError:
+                        if attempt == 2:
+                            raise
+                        time.sleep(2 * (attempt + 1))
+                if ki:
+                    _info(f"Gemini: {model} はキー{ki + 1}で成功しました")
+                yield f"使用モデル: {model}{tag}", res, model
+                return
+            except errors.ClientError as e:
+                code = getattr(e, "code", None)
+                last_err = e
+                if code in (401, 403):
+                    logger.warning("Gemini: %s キー%d は使えません (code=%s)", model, ki + 1, code)
+                    _warn(f"Gemini: キー{ki + 1} が使えません (code={code})")
+                    continue  # このキーはだめ。次のキーへ（最後のキーなら下のelseへ）
+                auth_only = False
+                logger.warning("%s%s でエラー (code=%s): %s", model, tag, code, e)
+                if code in (404, 429) and ki + 1 < len(clients):
+                    _warn(f"Gemini: {model}{tag} でエラー (code={code})。次のキーで試します")
+                    continue
+                _warn(f"Gemini: {model}{tag} でエラー (code={code})")
+                break  # 次のモデルへ
+            except (errors.ServerError, errors.APIError) as e:
+                auth_only = False
+                last_err = e
+                logger.warning("%s%s でサーバーエラー (%s): %s", model, tag, type(e).__name__, e)
+                _warn(f"Gemini: {model} でサーバーエラー (503等)。次の候補へ切り替えます")
+                break
+            except Exception as e:  # noqa: BLE001
+                auth_only = False
+                last_err = e
+                logger.warning("Gemini: %s%s で予期せぬエラー: %s", model, tag, e)
+                _warn(f"Gemini: {model} でエラー発生。次の候補へ切り替えます")
+                break
+        else:  # breakせずにキーを使い切った（最後のキーが401/403）
+            if auth_only:
+                raise last_err  # 全キーが認証エラー: 設定の問題なので、他のモデルを試しても無駄
 
     raise RuntimeError(
         f"すべてのGemini候補モデルの試行に失敗しました（最後のエラー: {last_err}）"
@@ -208,24 +247,166 @@ def _file_parts(f):
     return [f"=== ファイル: {f['name']} ===", body]
 
 
-def make_handoff_stream(files: list[dict], hint: str):
+# ---------------- 資料係（抜粋・要約）: 本命が使えないときは2案を作って人が選ぶ ----------------
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_WHO = "GPT-OSS（Groq）"
+GROQ_MAX_CHARS = int(os.getenv("GROQ_MAX_CHARS", "80000"))  # 131Kトークンに余裕を残した、資料の文字数の目安
+
+
+def groq_enabled() -> bool:
+    return bool(os.getenv("GROQ_API_KEY"))
+
+
+@cache
+def groq_client():
+    from groq import Groq  # Groqを使わない環境ではimport不要
+    return Groq(timeout=120)  # GROQ_API_KEY
+
+
+def _groq_chat(system: str, user: str, schema=None) -> str:
+    cl = groq_client()
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    kw = dict(model=GROQ_MODEL, messages=msgs, max_completion_tokens=16000)
+    if schema is None:
+        r = cl.chat.completions.create(**kw)
+    else:
+        sch = schema.model_json_schema()
+        try:
+            r = cl.chat.completions.create(
+                **kw, response_format={"type": "json_schema", "json_schema": {"name": "handoff", "schema": sch}})
+        except Exception as e:  # noqa: BLE001  スキーマ指定が通らない場合は、プロンプトにスキーマを書いてjson_objectで
+            logger.warning("Groq: json_schemaが使えないためjson_objectで再試行: %s", e)
+            msgs[0]["content"] = system + "\n\n出力は、次のJSON Schemaに従うJSONだけにしてください:\n" + json.dumps(sch, ensure_ascii=False)
+            r = cl.chat.completions.create(**kw, response_format={"type": "json_object"})
+    text = (r.choices[0].message.content or "").strip()
+    if not text:
+        raise RuntimeError("GPT-OSSの応答が空でした")
+    return text
+
+
+def _user_text(files: list[dict], hint: str) -> str:
+    body = "\n".join(f"=== ファイル: {f['name']} ===\n{f['text']}" for f in files)
+    return f"{body}\n=== ユーザーの相談（下書き。空のこともある） ===\n{hint or '（未入力）'}"
+
+
+def _groq_doc(kind: str, files: list[dict], hint: str, source: str) -> tuple[str, str]:
+    """Groq GPT-OSSで資料を作る。(doc, model)。使えない条件では理由つきでRuntimeError。"""
+    if any(f["text"] is None for f in files):
+        raise RuntimeError("PDFなどテキストでない資料はGPT-OSSの対象外です（txt/mdのみ）")
+    if len(source) > GROQ_MAX_CHARS:
+        raise RuntimeError(f"資料が長いためGPT-OSSは対象外です（{len(source):,}文字 > 目安{GROQ_MAX_CHARS:,}文字）")
+    user = _user_text(files, hint)
+    if kind == "handoff":
+        data = Handoff.model_validate_json(_groq_chat(HANDOFF_PROMPT, user, Handoff))
+        header = C.HANDOFF_HEADER.replace("Gemini", GROQ_WHO)  # 作ったのはGeminiではないので、ヘッダーの表記を合わせる
+        return header + json.dumps(data.model_dump(), ensure_ascii=False, indent=1), GROQ_MODEL
+    return SUMMARY_HEADER.replace("Gemini", GROQ_WHO) + _groq_chat(SUMMARY_PROMPT, user), GROQ_MODEL
+
+
+def _gemini_stream(kind: str, files: list[dict], hint: str, models=None):
+    """(status, doc, model)。kindは 'handoff'（抜粋）か 'summary'（要約）。"""
     parts = [p for f in files for p in _file_parts(f)]
     parts.append(f"=== ユーザーの相談（下書き。空のこともある） ===\n{hint or '（未入力）'}")
-    for status, res, model in _gen_stream(
-        parts, system_instruction=HANDOFF_PROMPT, response_mime_type="application/json", response_schema=Handoff
-    ):
+    if kind == "handoff":
+        cfg = dict(system_instruction=HANDOFF_PROMPT, response_mime_type="application/json", response_schema=Handoff)
+    else:
+        cfg = dict(system_instruction=SUMMARY_PROMPT)
+    for status, res, model in _gen_stream(parts, models=models, **cfg):
         if res is None:
             yield status, None, None
-        else:
+        elif kind == "handoff":
             data = res.parsed.model_dump() if res.parsed else json.loads(res.text)
-            doc = C.HANDOFF_HEADER + json.dumps(data, ensure_ascii=False, indent=1)
-            yield status, doc, model
+            yield status, C.HANDOFF_HEADER + json.dumps(data, ensure_ascii=False, indent=1), model
+        else:
+            yield status, SUMMARY_HEADER + res.text, model
+
+
+def _last_doc(gen) -> tuple[str, str]:
+    doc = model = None
+    for _, d, m in gen:
+        if d is not None:
+            doc, model = d, m
+    return doc, model
+
+
+def _with_compare(kind: str, files: list[dict], hint: str):
+    """本命（先頭のGeminiモデル）が使えればその1案。使えなければ、次のGeminiモデルとGroq GPT-OSSの2案を作り、
+    選択用の dict（{"choose": True, ...}）を結果として返す。どちらか片方しか作れなければ、その1案を使う。
+    Groqが未設定なら、従来どおり残りのGeminiモデルで続ける。"""
+    models = get_candidate_models()
+    try:
+        yield from _gemini_stream(kind, files, hint, models=models)
+        return
+    except RuntimeError as e:  # 401/403（キーの不備）は_gen_streamがそのまま投げるので、ここには来ない
+        primary_err = e
+    rest = models[1:]
+    if not groq_enabled():
+        if not rest:
+            raise
+        yield from _gemini_stream(kind, files, hint, models=rest)
+        return
+
+    yield f"{models[0]} が使えないため、{' / '.join(rest) or 'Gemini'} と {GROQ_WHO} の2案を作ります…", None, None
+    source = "\n\n".join(f["text"] or "" for f in files)
+    errors_: list[str] = []
+    out: list[dict] = []
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        jobs = []
+        if rest:
+            jobs.append(("Gemini", ex.submit(lambda: _last_doc(_gemini_stream(kind, files, hint, models=rest)))))
+        jobs.append((GROQ_WHO, ex.submit(_groq_doc, kind, files, hint, source)))
+        for who, fut in jobs:
+            try:
+                doc, model = fut.result()
+                if not doc:
+                    raise RuntimeError("空の結果でした")
+                out.append(dict(who=who, model=model, label=f"{who}（{model}）", doc=doc))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("2案作成: %s が失敗: %s", who, e)
+                errors_.append(f"{who}: {e}")
+    if len(out) == 2:
+        yield "2案ができました", dict(choose=True, kind=kind, options=out, source=source, errors=errors_), "compare"
+    elif len(out) == 1:
+        o = out[0]
+        yield f"{errors_[0]} のため、{o['label']} だけを使います", o["doc"], o["model"]
+    else:
+        raise RuntimeError(f"{models[0]} も、代わりの2案も作れませんでした（{primary_err} / {' / '.join(errors_)}）")
+
+
+def _norm(t: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", t))
+
+
+def _numbers(t: str) -> set[str]:
+    t = unicodedata.normalize("NFKC", t).replace(",", "")
+    return set(re.findall(r"\d+(?:\.\d+)?", t))
+
+
+def compare_stats(kind: str, doc: str, source: str) -> dict:
+    """2案を見比べるための客観的な目安。内容の良し悪しそのものは人が読んで判断する。"""
+    st: dict = {"chars": len(doc)}
+    if kind == "handoff":
+        m = re.search(r'\{\s*"relevant_files"', doc)
+        try:
+            data = json.loads(doc[m.start():]) if m else {}
+        except json.JSONDecodeError:
+            data = {}
+        evs = [e.get("text", "") for rf in data.get("relevant_files", []) for e in rf.get("evidence", [])]
+        src = _norm(source)
+        st.update(evidence=len(evs), verbatim=sum(1 for e in evs if _norm(e) and _norm(e) in src),
+                  uncertainties=len(data.get("uncertainties", [])), full_read=bool(data.get("full_read_required")))
+    else:
+        body = doc.split("\n\n", 1)[-1]
+        st["unknown_numbers"] = sorted(_numbers(body) - _numbers(source), key=float)[:15]
+    return st
+
+
+def make_handoff_stream(files: list[dict], hint: str):
+    yield from _with_compare("handoff", files, hint)
 
 
 def make_handoff(files: list[dict], hint: str) -> str:
-    for _, doc, _ in make_handoff_stream(files, hint):
-        if doc is not None:
-            return doc
+    return _last_doc(_gemini_stream("handoff", files, hint))[0]
 
 
 SUMMARY_PROMPT = """あなたは資料係です。指定ファイルを、後続の相談で使えるよう要約してください。
@@ -239,20 +420,11 @@ SUMMARY_HEADER = ("以下は資料をGeminiが要約したもの。原文では�
 
 
 def make_summary_stream(files: list[dict], hint: str):
-    parts = [p for f in files for p in _file_parts(f)]
-    parts.append(f"=== ユーザーの相談（下書き。空のこともある） ===\n{hint or '（未入力）'}")
-    for status, res, model in _gen_stream(parts, system_instruction=SUMMARY_PROMPT):
-        if res is None:
-            yield status, None, None
-        else:
-            doc = SUMMARY_HEADER + res.text
-            yield status, doc, model
+    yield from _with_compare("summary", files, hint)
 
 
 def make_summary(files: list[dict], hint: str) -> str:
-    for _, doc, _ in make_summary_stream(files, hint):
-        if doc is not None:
-            return doc
+    return _last_doc(_gemini_stream("summary", files, hint))[0]
 
 
 def make_fulltext_stream(files: list[dict]):
@@ -290,6 +462,39 @@ def summarize_history_stream(turns: list[tuple[str, str]]):
             yield status, None, None
         else:
             yield status, res.text, model
+
+
+# スレッド名の自動生成。軽く速いliteモデルを順に試す（環境変数 GEMINI_TITLE_MODEL を指定すればそれを最優先）
+TITLE_MODELS = ([os.environ["GEMINI_TITLE_MODEL"]] if os.getenv("GEMINI_TITLE_MODEL") else []) + [
+    "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+TITLE_PROMPT = (
+    "相談内容の題名を日本語で付けてください。\n"
+    "- 20文字以内。名詞中心で、後から一覧で見て何の相談か分かるようにする。\n"
+    "- 題名だけを1行で出力する。記号の飾り、かぎ括弧、説明は付けない。"
+)
+
+
+def make_title(question: str, doc_names: list[str] | None = None) -> str | None:
+    """相談文からスレッド名を作る。全候補が失敗・空の場合はNoneを返す（呼び出し側が先頭切り出しで代用する）。
+    Gemini 3系ではthinking_budgetもtemperatureも使わない（3.5 Flash-Liteは既定で最小の思考）。"""
+    body = (question or "").strip()[:600]
+    if doc_names:
+        body += f"\n（添付資料: {' / '.join(doc_names)[:200]}）"
+    if not body:
+        return None
+    for model in TITLE_MODELS:
+        try:
+            res = gemini().models.generate_content(
+                model=model, contents=body,
+                config=types.GenerateContentConfig(system_instruction=TITLE_PROMPT, max_output_tokens=200),
+            )
+            lines = (res.text or "").strip().splitlines()
+            title = lines[0].strip(" 「」『』\"'\u3000#*") if lines else ""
+            if title:
+                return title[:30]
+        except Exception as e:  # noqa: BLE001  題名のために相談を止めない。次の候補へ
+            logger.warning("スレッド名の生成に失敗（%s）: %s", model, e)
+    return None
 
 
 def summarize_history(turns: list[tuple[str, str]]) -> str:
