@@ -72,7 +72,7 @@ def save_safe(state: dict) -> str | None:
 
 def load(tid: str) -> dict:
     if BUCKET:
-        return json.loads(_bucket().blob(f"{PREFIX}{_check(tid)}.json").download_as_text("utf-8"))
+        return json.loads(_bucket().blob(f"{PREFIX}{_check(tid)}.json").download_as_text(encoding="utf-8"))
     return json.loads(_local(tid).read_text("utf-8"))
 
 
