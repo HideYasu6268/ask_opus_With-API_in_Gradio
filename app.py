@@ -375,6 +375,25 @@ def rename_thread(name, state):
     return state, thread_update(state)
 
 
+def delete_selected(tid, ok, state):
+    """サイドバーで選んだスレッドを、開かずに削除する（壊れていて開けないスレッドも消せる）。"""
+    if not tid:
+        gr.Warning("削除するチャットを一覧から選んでください")
+        return (state,) + (gr.update(),) * 8
+    if not ok:
+        gr.Warning("削除するには「削除を確認」にチェックを入れてください")
+        return (state,) + (gr.update(),) * 8
+    try:
+        T.delete(tid)
+    except Exception as e:  # noqa: BLE001
+        gr.Warning(f"削除に失敗しました: {e}")
+        return (state,) + (gr.update(),) * 8
+    if tid == state["id"]:  # 開いているスレッドを消したら新規に戻す
+        st = new_state()
+        return st, [], "", "", "", thread_update(st), st["title"], False, gr.update()
+    return state, gr.update(), gr.update(), gr.update(), gr.update(), thread_update(state), gr.update(), False, gr.update()
+
+
 def delete_thread(confirm, state):
     if not confirm:
         gr.Warning("削除するには「削除を確認」にチェックを入れてください")
@@ -441,6 +460,8 @@ with gr.Blocks(title="ask_opus_With_API_in_Gradio", theme=THEME, css=CSS) as dem
     with gr.Sidebar(open=False, position="left", width=300) as sidebar:
         new_btn = gr.Button("＋ 新規チャット", variant="primary", elem_id="newchat")
         thread_dd = gr.Radio([], value=None, label="最近のチャット", interactive=True, elem_id="threads")
+        side_del_ok = gr.Checkbox(label="削除を確認（元に戻せません）", value=False)
+        side_del_btn = gr.Button("🗑 選んだチャットを削除", variant="stop", size="sm")
 
     gr.Markdown("ask_opus_With_API_in_Gradio", elem_id="title")
     chat = gr.Chatbot(type="messages", height="60vh", show_label=False, elem_id="chat")
@@ -510,6 +531,9 @@ with gr.Blocks(title="ask_opus_With_API_in_Gradio", theme=THEME, css=CSS) as dem
     rename_btn.click(rename_thread, [rename_box, state], [state, thread_dd])
     del_btn.click(delete_thread, [del_ok, state],
                   [state, chat, cache_md, prep_status, cost, thread_dd, rename_box, del_ok, sidebar]) \
+        .then(show_choice, state, choice_out)
+    side_del_btn.click(delete_selected, [thread_dd, side_del_ok, state],
+                       [state, chat, cache_md, prep_status, cost, thread_dd, rename_box, side_del_ok, sidebar]) \
         .then(show_choice, state, choice_out)
     demo.load(lambda: thread_update(None), None, thread_dd)  # ページを開いたときに一覧を読む（stateは使わない: 初期化と競合するため）
 
